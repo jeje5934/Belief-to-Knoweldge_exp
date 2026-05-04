@@ -1,0 +1,34 @@
+# 대형 산출물·캐시: Cursor/agent 인덱싱·대량 참조 제외
+checkpoints/
+results/
+data/
+logs/
+.deps/
+__pycache__/
+
+# 바이너리 / 대형 파일
+*.pt
+*.pth
+*.npy
+*.npz
+*.bin
+*.h5
+*.hdf5
+
+# 이미지 / 영상
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.mp4
+*.avi
+
+# 로그 / CSV (스윕 결과물)
+*.log
+*.csv
+
+# 임시·OS
+*.swp
+*.tmp
+.DS_Store
+Thumbs.db
