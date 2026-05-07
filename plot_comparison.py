@@ -1,21 +1,31 @@
 """
-Eb/N0 sweep: baseline BP vs onlyextrinsic BP+Denoiser (alpha/beta).
+plot_comparison.py — Eb/N0 sweep: Baseline BP-30 vs Proposed [5x6].
 
-[onlyextrinsic variant — independent alpha/beta]
-  new_input = channel + beta * bp_ext + alpha * src_ext
+Main paper figure:
+  Baseline : pure BP, 30 total BP iterations ([5x6] same budget)
+  Proposed : [5,5,5,5,5,5], sigma=0.3, alpha=[0.10×5], beta=0.1
 
-Uses Fashion-MNIST **test set** (10,000 images, 28×28 grayscale) for
-evaluation. The denoiser is trained on the disjoint train set.
-
-Saves plot to results/comparison.png.
+  new_input = channel + beta * bp_ext + alpha_t * src_ext
+  bp_ext  = BP_post - payload_intr
+  src_ext = src_post - BP_post          (returned by SoftDenoiser)
 
 Usage:
-  CUDA_VISIBLE_DEVICES=0 python plot_comparison.py
-  CUDA_VISIBLE_DEVICES=0 python plot_comparison.py --alpha 0.1 --beta 0.1
-  CUDA_VISIBLE_DEVICES=0 python plot_comparison.py --alpha 0.1 --beta 0.0 --sigma 0.3
+  # Default (paper main figure)
+  python plot_comparison.py
+
+  # Custom schedule / knobs
+  python plot_comparison.py \\
+      --bp-schedule 5 5 5 5 5 5 \\
+      --alpha-schedule "0.10,0.10,0.10,0.10,0.10" \\
+      --beta 0.1 --sigma 0.3 \\
+      --ebno 0.4 0.5 0.6 0.7 0.8 0.9 1.0
+
+  # Quick smoke (small batch)
+  python plot_comparison.py --batch 32 --rounds 1
 """
 import argparse
 import os
+
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
@@ -24,6 +34,8 @@ import tensorflow as tf
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import torch
+import torchvision
 
 gpus = tf.config.list_physical_devices("GPU")
 for gpu in gpus:
@@ -37,29 +49,37 @@ from sionna.phy.channel.awgn import AWGN
 from sionna.phy.utils import ebnodb2no
 from decoder import LDPC5GDecoder_soft
 
-import torchvision
-
+# ── Constants ────────────────────────────────────────────────────────────────
 IMG_H, IMG_W, BPP = 28, 28, 8
-K_PAYLOAD = IMG_H * IMG_W * BPP  # 6272
+K_PAYLOAD = IMG_H * IMG_W * BPP   # 6272 bits
 
-CRC_DEGREE = "CRC24A"
-N_CODEWORD = 12600
-NUM_BPS = 1
+CRC_DEGREE  = "CRC24A"
+N_CODEWORD  = 12600
+NUM_BPS     = 1                   # BPSK
+SEED        = 42
+CKPT        = "checkpoints/denoiser.pt"
 
-BEST_ALPHA = 0.1
-BEST_BETA = 0.1
-BEST_SIGMA = 0.3
-BP_SCHEDULE = [10, 10, 10]
-BATCH = 200
-ROUNDS = 5
-SEED = 42
-CKPT = "checkpoints/denoiser.pt"
+# ── Paper-default hyper-parameters ───────────────────────────────────────────
+DEFAULT_BP_SCHEDULE   = [5, 5, 5, 5, 5, 5]        # 30 total BP iter
+DEFAULT_ALPHA_SCHED   = "0.10,0.10,0.10,0.10,0.10"
+DEFAULT_BETA          = 0.1
+DEFAULT_SIGMA         = 0.3
+DEFAULT_EBNO          = [0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2]
+DEFAULT_BATCH         = 200
+DEFAULT_ROUNDS        = 5
 
-EBNO_LIST = [0.4, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.4]
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def parse_alpha_schedule(s: str) -> list:
+    return [float(x.strip()) for x in s.split(",") if x.strip()]
+
+
+def fmt_sched(sched: list) -> str:
+    return "[" + ",".join(f"{a:.2f}" for a in sched) + "]"
 
 
 def build_test_bitbank():
-    """Fashion-MNIST test set (10,000 images), grayscale 28x28 → 6272 bits each."""
     ds = torchvision.datasets.FashionMNIST(
         root="/tmp/fmnist", train=False, download=True)
     images = np.array([np.array(img) for img, _ in ds], dtype=np.uint8)
@@ -69,18 +89,18 @@ def build_test_bitbank():
 
 
 def run_sweep(ebno_list, dec_base, dec_dn, ldpc_enc, crc_enc, crc_dec,
-              mapper, demapper, awgn, bit_bank):
-    results = {"ebno": [], "nack_base": [], "nack_dn": [],
-               "err_base": [], "err_dn": []}
+              mapper, demapper, awgn, bit_bank, batch, rounds):
+    nack_base, nack_dn, ber_base, ber_dn = [], [], [], []
+    total = batch * rounds
 
     for ebno in ebno_list:
         no = ebnodb2no(ebno, NUM_BPS, ldpc_enc.coderate)
         ab = eb = ad = ed = 0
 
-        for r in range(ROUNDS):
+        for r in range(rounds):
             tf.random.set_seed(SEED + r + int(ebno * 1000))
             n_imgs = tf.shape(bit_bank)[0]
-            idx = tf.random.uniform([BATCH], 0, n_imgs, dtype=tf.int32)
+            idx = tf.random.uniform([batch], 0, n_imgs, dtype=tf.int32)
             u = tf.gather(bit_bank, idx)
             u_crc = crc_enc(tf.cast(u, ldpc_enc.rdtype))
             c = ldpc_enc(u_crc)
@@ -102,117 +122,170 @@ def run_sweep(ebno_list, dec_base, dec_dn, ldpc_enc, crc_enc, crc_dec,
                 tf.not_equal(u, tf.cast(hat_d[:, :K_PAYLOAD] > 0, tf.int32)),
                 tf.int32)).numpy())
 
-        total = BATCH * ROUNDS
-        results["ebno"].append(ebno)
-        results["nack_base"].append((total - ab) / total)
-        results["nack_dn"].append((total - ad) / total)
-        results["err_base"].append(eb / (total * K_PAYLOAD))
-        results["err_dn"].append(ed / (total * K_PAYLOAD))
+        nack_base.append((total - ab) / total)
+        nack_dn.append((total - ad) / total)
+        ber_base.append(eb / (total * K_PAYLOAD))
+        ber_dn.append(ed / (total * K_PAYLOAD))
 
-        print(f"Eb/N0={ebno:+.1f} dB  |  "
-              f"Baseline NACK={total-ab:>4}/{total}  BER={eb/(total*K_PAYLOAD):.2e}  |  "
-              f"Denoiser NACK={total-ad:>4}/{total}  BER={ed/(total*K_PAYLOAD):.2e}")
-    return results
+        print(f"  Eb/N0={ebno:+.2f}  "
+              f"Baseline BLER={nack_base[-1]:.4f} BER={ber_base[-1]:.2e}  |  "
+              f"Proposed BLER={nack_dn[-1]:.4f} BER={ber_dn[-1]:.2e}  "
+              f"(ACK {ad}/{total})")
 
+    return nack_base, nack_dn, ber_base, ber_dn
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Plot Baseline BP-30 vs Proposed [5x6] BLER/BER curves.")
+
+    p.add_argument("--bp-schedule", type=int, nargs="+",
+                   default=DEFAULT_BP_SCHEDULE, metavar="ITER",
+                   help="BP iterations per chunk (default: 5 5 5 5 5 5)")
+    p.add_argument("--alpha-schedule", type=str,
+                   default=DEFAULT_ALPHA_SCHED, metavar="SCHED",
+                   help='Per-call alpha as comma-separated string '
+                        '(default: "0.10,0.10,0.10,0.10,0.10")')
+    p.add_argument("--alpha", type=float, default=None,
+                   help="Scalar alpha (overrides --alpha-schedule with constant)")
+    p.add_argument("--beta", type=float, default=DEFAULT_BETA)
+    p.add_argument("--sigma", type=float, default=DEFAULT_SIGMA)
+    p.add_argument("--ckpt", default=CKPT)
+    p.add_argument("--ebno", type=float, nargs="+",
+                   default=DEFAULT_EBNO, metavar="DB")
+    p.add_argument("--batch", type=int, default=DEFAULT_BATCH)
+    p.add_argument("--rounds", type=int, default=DEFAULT_ROUNDS)
+    p.add_argument("--out", default="results/comparison.png",
+                   help="Output PNG path")
+    return p.parse_args()
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--alpha", type=float, default=BEST_ALPHA)
-    p.add_argument("--beta", type=float, default=BEST_BETA)
-    p.add_argument("--sigma", type=float, default=BEST_SIGMA)
-    p.add_argument("--ckpt", default=CKPT)
-    p.add_argument("--ebno", type=float, nargs="+", default=EBNO_LIST)
-    args = p.parse_args()
+    args = parse_args()
 
+    # Resolve alpha schedule
+    if args.alpha is not None:
+        n_denoiser = max(len(args.bp_schedule) - 1, 0)
+        alpha_sched = [args.alpha] * max(n_denoiser, 1)
+    else:
+        alpha_sched = parse_alpha_schedule(args.alpha_schedule)
+
+    bp_total = sum(args.bp_schedule)
+    n_denoiser_calls = max(len(args.bp_schedule) - 1, 0)
+
+    print("=" * 68)
+    print("plot_comparison — Baseline BP-30 vs Proposed [5x6]")
+    print(f"  BP schedule    : {args.bp_schedule}  ({bp_total} total iter)")
+    print(f"  Denoiser calls : {n_denoiser_calls}")
+    print(f"  alpha schedule : {fmt_sched(alpha_sched)}")
+    print(f"  beta           : {args.beta}")
+    print(f"  sigma          : {args.sigma}  (fixed)")
+    print(f"  Eb/N0          : {args.ebno}")
+    print(f"  batch={args.batch}  rounds={args.rounds}  "
+          f"blocks/ebno={args.batch * args.rounds}")
+    print("=" * 68)
+
+    # ── Sionna setup ─────────────────────────────────────────────────────────
     crc_enc = CRCEncoder(CRC_DEGREE)
     crc_dec = CRCDecoder(crc_enc)
-    k_ldpc = K_PAYLOAD + crc_enc.crc_length
+    k_ldpc  = K_PAYLOAD + crc_enc.crc_length
     ldpc_enc = LDPC5GEncoder(k_ldpc, N_CODEWORD, num_bits_per_symbol=NUM_BPS)
+    mapper   = Mapper(constellation_type="pam", num_bits_per_symbol=NUM_BPS)
+    demapper = Demapper("app", constellation_type="pam",
+                        num_bits_per_symbol=NUM_BPS)
+    awgn     = AWGN()
+    bit_bank = build_test_bitbank()
 
+    # ── Baseline: pure BP, same total iter ───────────────────────────────────
     dec_base = LDPC5GDecoder(
         ldpc_enc, cn_update="boxplus-phi", vn_update="sum",
         cn_schedule="flooding", hard_out=False, return_infobits=True,
-        num_iter=sum(BP_SCHEDULE), llr_max=30.0)
+        num_iter=bp_total, llr_max=30.0)
 
+    # ── Proposed: [5x6] + source-prior extrinsic ─────────────────────────────
     dec_dn = LDPC5GDecoder_soft(
-        ldpc_enc, bp_schedule=BP_SCHEDULE,
-        alpha=args.alpha, beta=args.beta, k_payload=K_PAYLOAD,
+        ldpc_enc,
+        bp_schedule=args.bp_schedule,
+        alpha=alpha_sched[0],
+        beta=args.beta,
+        alpha_schedule=alpha_sched,
+        k_payload=K_PAYLOAD,
         cn_update="boxplus-phi", vn_update="sum",
         cn_schedule="flooding", hard_out=False, return_infobits=True,
-        num_iter=sum(BP_SCHEDULE), llr_max=30.0)
+        num_iter=bp_total, llr_max=30.0)
 
+    # Load checkpoint once into memory, apply via load_state_dict
     if os.path.isfile(args.ckpt):
-        dec_dn.denoiser.load_weights_pt(args.ckpt)
-        print(f"[INFO] Loaded {args.ckpt}")
+        ckpt_state = torch.load(args.ckpt, map_location="cpu", weights_only=True)
+        dec_dn.denoiser.prior_model.load_state_dict(ckpt_state)
+        dec_dn.denoiser.prior_model.eval()
+        print(f"Checkpoint loaded: {args.ckpt}")
     else:
-        print(f"[WARN] {args.ckpt} not found")
+        print(f"[WARN] {args.ckpt} not found — using random weights")
+
     dec_dn.denoiser.sigma = args.sigma
 
-    mapper = Mapper(constellation_type="pam", num_bits_per_symbol=NUM_BPS)
-    demapper = Demapper("app", constellation_type="pam",
-                        num_bits_per_symbol=NUM_BPS)
-    awgn = AWGN()
+    # ── Run sweep ─────────────────────────────────────────────────────────────
+    print()
+    nack_base, nack_dn, ber_base, ber_dn = run_sweep(
+        args.ebno, dec_base, dec_dn, ldpc_enc, crc_enc, crc_dec,
+        mapper, demapper, awgn, bit_bank, args.batch, args.rounds)
 
-    bit_bank = build_test_bitbank()
-    print(f"Test bitbank: {bit_bank.shape} (Fashion-MNIST test set, "
-          f"grayscale {IMG_H}x{IMG_W}, {BPP}-bit → {K_PAYLOAD} bits/img)")
-    print(f"α={args.alpha}  β={args.beta}  σ={args.sigma}  "
-          f"schedule={BP_SCHEDULE}\n")
+    # ── Plot ──────────────────────────────────────────────────────────────────
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
 
-    res = run_sweep(args.ebno, dec_base, dec_dn, ldpc_enc, crc_enc,
-                    crc_dec, mapper, demapper, awgn, bit_bank)
+    base_label = f"Baseline BP ({bp_total} iter)"
+    prop_label = (f"Proposed: {args.bp_schedule}  "
+                  f"α={fmt_sched(alpha_sched)}  β={args.beta}  σ={args.sigma}")
 
-    # ---- plot ----
-    os.makedirs("results", exist_ok=True)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5.5))
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
-
-    dn_label = (f"BP + Denoiser (α={args.alpha}, β={args.beta}, "
-                f"σ={args.sigma})")
-
-    # NACK rate (= BLER)
-    ax1.semilogy(res["ebno"], res["nack_base"], "o-", color="#d62728",
-                 linewidth=2, markersize=7,
-                 label=f"Baseline BP ({sum(BP_SCHEDULE)} iter)")
-    ax1.semilogy(res["ebno"], res["nack_dn"], "s-", color="#1f77b4",
-                 linewidth=2, markersize=7, label=dn_label)
+    # BLER
+    ax1.semilogy(args.ebno, nack_base, "o--", color="#d62728",
+                 linewidth=2, markersize=7, label=base_label)
+    ax1.semilogy(args.ebno, nack_dn, "s-", color="#1f77b4",
+                 linewidth=2.5, markersize=7, label=prop_label)
     ax1.set_xlabel("Eb/N0 (dB)", fontsize=12)
-    ax1.set_ylabel("NACK Rate (BLER)", fontsize=12)
+    ax1.set_ylabel("BLER (NACK rate)", fontsize=12)
     ax1.set_title("Block Error Rate", fontsize=13)
-    ax1.legend(fontsize=10)
+    ax1.legend(fontsize=9, loc="upper right")
     ax1.grid(True, which="both", alpha=0.3)
-    ax1.set_ylim(bottom=5e-4)
+    ax1.set_ylim(bottom=1e-3)
 
     # BER
-    mask_b = [v > 0 for v in res["err_base"]]
-    mask_d = [v > 0 for v in res["err_dn"]]
-    eb_b = [e for e, m in zip(res["ebno"], mask_b) if m]
-    er_b = [e for e, m in zip(res["err_base"], mask_b) if m]
-    eb_d = [e for e, m in zip(res["ebno"], mask_d) if m]
-    er_d = [e for e, m in zip(res["err_dn"], mask_d) if m]
+    def pos(xs, ys):
+        pairs = [(x, y) for x, y in zip(xs, ys) if y > 0]
+        return zip(*pairs) if pairs else ([], [])
 
+    eb_b, er_b = pos(args.ebno, ber_base)
+    eb_d, er_d = pos(args.ebno, ber_dn)
     if er_b:
-        ax2.semilogy(eb_b, er_b, "o-", color="#d62728",
-                     linewidth=2, markersize=7, label="Baseline BP")
+        ax2.semilogy(list(eb_b), list(er_b), "o--", color="#d62728",
+                     linewidth=2, markersize=7, label=base_label)
     if er_d:
-        ax2.semilogy(eb_d, er_d, "s-", color="#1f77b4",
-                     linewidth=2, markersize=7,
-                     label=f"BP + Denoiser (α={args.alpha}, β={args.beta})")
+        ax2.semilogy(list(eb_d), list(er_d), "s-", color="#1f77b4",
+                     linewidth=2.5, markersize=7, label=prop_label)
     ax2.set_xlabel("Eb/N0 (dB)", fontsize=12)
-    ax2.set_ylabel("Bit Error Rate", fontsize=12)
+    ax2.set_ylabel("BER", fontsize=12)
     ax2.set_title("Bit Error Rate", fontsize=13)
-    ax2.legend(fontsize=10)
+    ax2.legend(fontsize=9, loc="upper right")
     ax2.grid(True, which="both", alpha=0.3)
 
     fig.suptitle(
-        "Fashion-MNIST over AWGN — Baseline BP vs onlyextrinsic BP+Denoiser\n"
-        f"new_input = ch + β·bp_ext + α·src_ext  |  "
-        f"K={K_PAYLOAD}, N={N_CODEWORD}, BPSK, schedule={BP_SCHEDULE}, test set",
-        fontsize=11, y=1.02)
+        "Fashion-MNIST / AWGN  —  Baseline BP-30 vs Proposed Source-Prior Extrinsic\n"
+        f"new_input = ch + β·bp_ext + αₜ·src_ext  |  "
+        f"K={K_PAYLOAD}, N={N_CODEWORD}, BPSK  |  "
+        f"{args.batch * args.rounds} blocks/point",
+        fontsize=10, y=1.02)
     fig.tight_layout()
-    out = "results/comparison.png"
-    fig.savefig(out, dpi=150, bbox_inches="tight")
-    print(f"\nPlot saved → {out}")
+
+    fig.savefig(args.out, dpi=150, bbox_inches="tight")
+    print(f"\nPlot saved → {args.out}")
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 """
 LDPC5GDecoder_soft — BP + source-extrinsic denoiser.
 
-[onlyextrinsic variant — independent alpha/beta, turbo-style extrinsic]
+[onlyextrinsic vanilla — fixed sigma=0.3, no adaptive sigma]
 
   Turbo-style extrinsic definitions
   ---------------------------------
@@ -17,11 +17,16 @@ LDPC5GDecoder_soft — BP + source-extrinsic denoiser.
 
   Update equation
   ---------------
-    new_input = channel + beta * bp_ext + alpha * src_ext
+    new_input = channel + beta * bp_ext + alpha_t * src_ext
 
   Knobs:
-    alpha  — source/denoiser extrinsic weight
-    beta   — BP extrinsic weight
+    alpha          — scalar source extrinsic weight (used as constant schedule)
+    alpha_schedule — optional list of per-call alpha values [alpha_0, alpha_1, ...]
+                     overrides scalar alpha when provided.
+                     Length mismatch handling:
+                       shorter → repeat last value (with INFO log)
+                       longer  → truncate extra entries (with WARN log)
+    beta           — BP extrinsic weight (sweep around 0)
 
   Special cases:
     alpha=0, beta=0    →  new_input = channel                (baseline BP, no denoiser)
@@ -35,6 +40,7 @@ LDPC5GDecoder_soft — BP + source-extrinsic denoiser.
       extrinsic terms, so subtracting it gives a strictly cleaner extrinsic.
     * The denoiser is non-linear, so ``src_post - BP_post`` is the standard
       practical approximation of true source extrinsic in the turbo sense.
+    * sigma is fixed at 0.3 for this vanilla branch; set dec.denoiser.sigma = 0.3.
 """
 from __future__ import annotations
 
@@ -48,6 +54,7 @@ class LDPC5GDecoder_soft(LDPC5GDecoder):
 
     def __init__(self, encoder, *, bp_schedule=None,
                  alpha=0.0, beta=0.0,
+                 alpha_schedule=None,
                  k_payload=None, img_h=28, img_w=28, bits_per_pixel=8,
                  denoiser_kwargs=None, **kwargs):
         super().__init__(encoder, **kwargs)
@@ -62,6 +69,27 @@ class LDPC5GDecoder_soft(LDPC5GDecoder):
             img_h=img_h, img_w=img_w, bits_per_pixel=bits_per_pixel,
             **dn_kw)
 
+        # Resolve per-call alpha schedule.
+        # n_denoiser = number of denoiser calls = len(schedule) - 1.
+        n_denoiser = max(len(self._bp_schedule_custom) - 1, 0)
+        if alpha_schedule is not None:
+            raw = [float(a) for a in alpha_schedule]
+            if len(raw) < n_denoiser:
+                print(
+                    f"[INFO] alpha_schedule {raw} has fewer entries ({len(raw)}) "
+                    f"than denoiser calls ({n_denoiser}); repeating last value {raw[-1]:.4f}."
+                )
+                raw = raw + [raw[-1]] * (n_denoiser - len(raw))
+            elif len(raw) > n_denoiser:
+                print(
+                    f"[WARN] alpha_schedule {raw} has more entries ({len(raw)}) "
+                    f"than denoiser calls ({n_denoiser}); ignoring extra entries."
+                )
+                raw = raw[:n_denoiser]
+            self._alpha_schedule = raw
+        else:
+            self._alpha_schedule = [float(alpha)] * max(n_denoiser, 1)
+
     @property
     def alpha(self):
         return self._alpha
@@ -69,6 +97,15 @@ class LDPC5GDecoder_soft(LDPC5GDecoder):
     @alpha.setter
     def alpha(self, value):
         self._alpha = float(value)
+
+    @property
+    def alpha_schedule(self):
+        return list(self._alpha_schedule)
+
+    @alpha_schedule.setter
+    def alpha_schedule(self, value):
+        """Set per-call alpha schedule. Length is NOT re-validated here."""
+        self._alpha_schedule = [float(a) for a in value]
 
     @property
     def beta(self):
@@ -136,7 +173,8 @@ class LDPC5GDecoder_soft(LDPC5GDecoder):
         prev_hard_out = getattr(self, "_hard_out", False)
         x_hat = None
 
-        a = tf.cast(self._alpha, self.rdtype)
+        # Pre-cast per-call alpha schedule and beta to the layer's dtype.
+        alpha_vals = [tf.cast(a, self.rdtype) for a in self._alpha_schedule]
         b = tf.cast(self._beta, self.rdtype)
 
         try:
@@ -157,16 +195,18 @@ class LDPC5GDecoder_soft(LDPC5GDecoder):
 
                     # Turbo-style BP extrinsic:
                     #   bp_ext = BP_post - (a priori input that was fed to BP)
-                    # ``payload_intr`` here is still the value used as input to
-                    # this BP chunk; we subtract it BEFORE updating it below.
+                    # ``payload_intr`` is the value fed to *this* BP chunk;
+                    # subtract it before updating below.
                     bp_ext = post_payload - payload_intr
 
-                    # Source extrinsic (denoiser input == BP_post == post_payload):
+                    # Source extrinsic returned directly by SoftDenoiser:
                     #   src_ext = src_post - BP_post
                     src_ext = self._denoiser(post_payload)
 
-                    # new_input = channel + beta * bp_ext + alpha * src_ext
-                    payload_intr = payload0 + b * bp_ext + a * src_ext
+                    # Per-call alpha: alpha_vals[idx] for the idx-th denoiser call.
+                    # new_input = channel + beta * bp_ext + alpha_t * src_ext
+                    a_t = alpha_vals[idx] if idx < len(alpha_vals) else alpha_vals[-1]
+                    payload_intr = payload0 + b * bp_ext + a_t * src_ext
 
         finally:
             self._return_state = prev_return_state
