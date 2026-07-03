@@ -75,6 +75,14 @@ extrinsic을 얹는다:
 
 즉 BP extrinsic과 source extrinsic을 **분리해 동시에** `channel` 위로 반영한다.
 
+### 적용 범위: extrinsic 되먹임은 payload(이미지) 비트에만
+
+`payload_intr`은 **payload(이미지) 비트 `k_payload = 6272`개에만** 해당한다. BP 입력은
+`llr_bp = concat([payload_intr, crc_and_rest, filler, parity])` 형태로 재구성되는데,
+extrinsic 갱신을 받는 것은 앞의 payload 슬라이스뿐이고 **CRC24 비트(24개)·filler·parity는
+매 청크 channel LLR 값으로 고정**된다. `bp_ext`/`src_ext`도 payload 슬라이스 위에서만
+계산된다. (denoiser는 이미지 prior이므로 이미지 비트에만 작용하는 것이 자연스럽다.)
+
 ### 특수 케이스 (코드 주석과 일치)
 
 | α | β | `new_input` | 의미 |
@@ -82,6 +90,19 @@ extrinsic을 얹는다:
 | 0 | 0 | `channel` | baseline BP (denoiser 미사용) |
 | 0.1 | 0 | `channel + 0.1·src_ext` | denoiser-only 보정 |
 | 0 | 1 | `BP_post` | turbo BP 되먹임 |
+
+### 구현 대조 (numerically verified)
+
+이 갱신식은 실제 `decoder.py` 구현과 **수치적으로 정확히 일치**함을 확인했다. 소규모
+배치에서 BP 입출력과 denoiser 입출력을 계측해 대조한 결과:
+
+- chunk-0의 BP a priori 입력 **== channel**(frozen base),
+- 매 denoiser 호출의 입력 **== `BP_post`**,
+- `payload_intr[i+1]` **== `channel + β·bp_ext[i] + α_t·src_ext[i]`** (모든 청크에서 `max|Δ|=0`),
+- base가 청크 진행 중 `channel`로 고정(site 누적 없음),
+- alpha 인덱싱: `i`번째 denoiser 호출이 `alpha_schedule[i]` 사용.
+
+즉 `decoder.py`의 루프([`call()`](decoder.py))는 위 식 그대로다.
 
 ---
 
